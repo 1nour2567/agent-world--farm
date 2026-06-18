@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets
+.env
+
+# Generated
+*.txt
+!requirements.txt
+agent_out*.txt
+agent_err*.txt
+server_out.txt
+server_err.txt
+farm_log.txt
+
+# Vault runtime data
+state/
+decisions/
+memory/
+knowledge/
+logs/
+daily/
+people/
+
+# OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

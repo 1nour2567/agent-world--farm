@@ -33,6 +33,9 @@ def vread(vault_root, path):
 def vappend(vault_root, path, content):
     """Append content to a vault file. Creates dirs if needed."""
     clean = path.replace('/', os.sep)
+    # Sanitize invalid Windows path characters
+    for ch in '<>:"|?*':
+        clean = clean.replace(ch, '_')
     full = os.path.join(vault_root, clean)
     os.makedirs(os.path.dirname(full), exist_ok=True)
     with open(full, 'a', encoding='utf-8') as f:
@@ -112,6 +115,17 @@ ACTION_TO_EVENT_TYPE = {
     "prune": "action_prune",
     "spread_manure": "action_spread_manure",
     "insurance": "meta_insurance",
+    # Phase W2: Social
+    "social_msg": "social_interaction",
+    "social_lookup": "social_interaction",
+    # Phase W3: Books
+    "read_book": "action_read_book",
+    "buy_book": "economic_transaction",
+    # Phase W6: Trading
+    "trade_propose": "economic_trade",
+    "trade_accept": "economic_trade",
+    "trade_counter": "economic_trade",
+    "trade_reject": "economic_trade",
 }
 
 # ── Auto-tagging: action → default tags ──
@@ -124,6 +138,9 @@ ACTION_TAGS = {
     "save_seeds": ["genetics"], "breed": ["genetics", "livestock"],
     "sleep": ["body"], "eat": ["body"], "exercise": ["body"],
     "next_day": ["meta"], "remember": ["memory"], "recall": ["memory"],
+    "social_msg": ["social"], "social_lookup": ["social"],
+    "trade_propose": ["economy", "trade"], "trade_accept": ["economy", "trade"],
+    "trade_counter": ["economy", "trade"], "trade_reject": ["economy", "trade"],
 }
 
 

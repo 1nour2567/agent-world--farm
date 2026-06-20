@@ -425,22 +425,64 @@ soil_type, moisture_estimate, wood_quality, hidden_resource (近距)
 
 ## 23. 多Agent与社交系统
 
-**Phase W2**. 多个 Agent 共享同一个物理世界，通过社交交互。
+**Phase W2, 2026-06-20 增强**. 多个 Agent 共享同一个物理世界，通过社交交互形成 emergent 协作。
 
 ### 文件
 - `multi_agent_launcher.py` — 159 行
 - `agent-world-llm.py --profile` 参数化
+- `agent_profile.py:resolve_agent_name()` — 中英文名称映射
 
-### 社交动作
+### 社交动作（6 种）
 
 **social_msg(target, message):**
 - 写入 `PARENT_VAULT/social/{target}_inbox.md`
-- 接收方下次 cycle 读取并清空
+- 接收方下次 cycle 读取并注入 prompt
+- 消息带发送方游戏时间戳（支持跨时间通信）
+- 读后清空收件箱，内容通过 `remember("from_"+sender, msg)` 存入长期记忆
 - 25% 概率附带传言传播
 
 **social_lookup(target):**
 - 读取 `agents/{target}/state/farm.md`
-- 返回对方农场快照
+- 返回对方农场快照（金币/作物/库存/需求）
+
+**bulletin_post(message):**
+- 广播消息到**所有其他 agent** 的收件箱
+- 生态事件后 Agent 自发发布（"野兔毁了10株小麦！建围栏需要2000G！"）
+- agent_profile 名解析：接受中文名或英文 ID
+
+**bulletin_read():**
+- 扫描 `social/` 目录下所有收件箱，提取公告内容
+- 返回最近 10 条公告摘要
+
+**send_gold(target, amount):**
+- 本地文件转账通知（不经过服务器）
+- 自动从发送方 state["gold"] 扣款
+- 参数规范化：LLM 可用 `amount` 或 `quantity` 键
+
+**send_gift(target, item, qty):**
+- 本地文件赠礼通知
+- 写入接收方收件箱
+
+### 名称映射系统
+LLM 用中文显示名做 target（如"铁娘子"），系统自动解析为 profile ID（"iron_lady"）：
+- `agent_profile.resolve_agent_name("铁娘子")` → `"iron_lady"`
+- `agent_profile.build_name_map()` → `{"续仁武":"xu_renwu", "老王":"old_wang", "铁娘子":"iron_lady"}`
+- 收件箱读写同时检查 `{id}_inbox.md` 和 `{display_name}_inbox.md`
+
+### 家庭叙事
+SYSTEM_PROMPT 将三个 Agent 定义为**血脉相连的家人**：
+- 不需建立信任——生来信任彼此
+- 金币共享、物资调剂
+- 生态威胁出现时全员协作防御（公告→凑钱→建围栏）
+- 每天 21:00 是收信时间
+
+### Emergent 协作实例（已验证）
+```
+野兔毁作物 → xu_renwu bulletin_post →
+old_wang: "我出1000G，你出490G" →
+iron_lady: send_gold(889G) →
+三人凑到2000G → 建围栏保护全家
+```
 
 ### 多 Agent 启动
 ```bash
@@ -575,7 +617,64 @@ python multi_agent_launcher.py --agents xu_renwu,old_wang
 
 ---
 
-## 28. 动作完整清单（60+）
+## 28. 野生动物生态系统（Phase W6）
+
+### 概述
+13 种野生动物分布在 6 种 biome 中，形成完整的捕食食物链。种群数量、饱食度、繁殖/死亡每日更新。野生动物与农场交互，造成作物损失或牲畜攻击。
+
+### 文件
+- `ecology.json` — 13 物种定义（食性、捕食链、农场交互）
+- `ecology_engine.py` — 种群动态引擎（~360 行）
+
+### 13 物种概览
+
+| 物种 | 食性 | 天敌 | 农场影响 |
+|------|------|------|---------|
+| 野兔 | 草食 | 狐狸/狼/鹰 | 偷吃未收作物 |
+| 鹿 | 草食 | 狼 | 偷吃作物 + 踩踏幼苗 |
+| 野猪 | 杂食 | 狼 | 拱地破坏翻耕地 |
+| 狼 | 肉食 | — | **攻击牲畜** |
+| 狐狸 | 杂食 | 狼/鹰 | 偷吃鸡蛋 |
+| 鹰 | 肉食 | — | 抓小鸡 |
+| 野羊 | 草食 | 狼 | 和家羊抢草场 |
+| 猫头鹰 | 肉食 | — | 无害（吃鼠） |
+| 蛙 | 食虫 | 鹭 | 有益（吃害虫） |
+| 鹭 | 肉食 | — | 吃池塘鱼 |
+| 鱼 | 草食 | 鹭 | 无害 |
+
+### 狼攻击牲畜的二元触发
+
+| 攻击类型 | 触发条件 | 描述 | Agent 反思 |
+|---------|---------|------|-----------|
+| 饥饿攻击 | satiation < 30 | "狼群因为饥饿袭击了羊圈——冬天的猎物太少了" | 生态失衡 |
+| 机会攻击 | 围栏破损 | "一只狼从破损的围栏钻进了羊圈" | 自己的疏忽 |
+
+### Agent 感知
+
+SenseCompiler 对野生动物生成三级精度描述：
+
+| 距离 | 示例描述 |
+|------|---------|
+| 远距 | "远处的山上传来了狼嚎" / "天空中有鹰在盘旋" |
+| 中距 | "地上有大大的狼爪印——离农场不远了" |
+| 近距 | "羊圈外面有狼的新鲜足迹！昨晚来过了！" |
+
+### 生态中断（2 个新增）
+
+| 中断 | 优先级 | 触发 |
+|------|--------|------|
+| wolf_attack | P1 | ecology_alerts 包含 livestock_attack |
+| crop_raided | P2 | 作物大面积被破坏 |
+
+### API 新增字段
+- `ecology_observations`: 近距生态感知文本列表
+- `ecology_distant`: 远距生态感知
+- `wolf_warning`: 狼群威胁评估
+- `ecology_alerts`: 当日生态事件
+
+---
+
+## 29. 动作完整清单（60+）
 
 ### 农耕 (11)
 `till, till_bulk, plant, plant_bulk, plant_tree, water, harvest, weed_all, save_seeds, prune, fell_tree`
@@ -615,7 +714,7 @@ python multi_agent_launcher.py --agents xu_renwu,old_wang
 
 ---
 
-## 29. 文件架构
+## 30. 文件架构
 
 ```
 C:\agent-brain\                          ← 生产环境
@@ -658,7 +757,7 @@ C:\agent-brain\                          ← 生产环境
 
 ---
 
-## 30. API参考
+## 31. API参考
 
 ### Agent World (8080)
 ```

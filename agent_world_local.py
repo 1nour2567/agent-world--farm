@@ -6,6 +6,7 @@ Same API protocol as real Agent World.
 """
 import http.server, json, re, time, uuid, random, threading, os, urllib.parse
 import sense_compiler  # data-driven NL sensory compiler (Phase E4)
+import ecology_engine  # Phase W6: wildlife ecosystem + farm interaction
 
 PORT_WORLD = 8080
 PORT_FARM  = 8081
@@ -17,14 +18,35 @@ agents = {}        # api_key -> {agent_id, username, nickname, bio, avatar, crea
 api_key_to_id = {} # api_key -> agent_id
 farms = {}         # farm_id -> farm state
 bar_sessions = {}  # session_id -> {agent_id, drink, consumed, mood}
+# Track agents active in the current server session (for day barrier)
+_active_session_agents = set()
 
 SEASONS = ["Spring","Summer","Fall","Winter"]
 
-# ═══════════════ TERRAIN & GEOGRAPHY ═══════════════
-GRID_SIZE_X = 20   # simulation core — keep lean for LLM cycles
-GRID_SIZE_Y = 28
+# ═══════════════ TERRAIN & GEOGRAPHY (Phase W4) ═══════════════
+GRID_SIZE_X = 50   # expanded for multi-biome world
+GRID_SIZE_Y = 50
 ZONE_TYPES = ["farmland","pasture","orchard","water_source","building_area","wild_buffer"]
-# Soil physics
+
+# ═══════════════ DAY BARRIER (Phase W5: multi-agent sync) ═══════════════
+# When all agents reach 24:00, the day advances together.
+# Each farm_id -> True when that agent is ready for next day.
+_day_barrier = {}
+# Public bulletin board: list of {author, season, day, hour, message}
+_bulletin_board = []
+
+# Load biome definitions
+def _load_biomes():
+    import os as _os
+    _bp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "biomes.json")
+    if os.path.exists(_bp):
+        with open(_bp, "r", encoding="utf-8") as _f:
+            return json.load(_f)
+    return {"biomes": {}}
+
+BIOME_DEFS = _load_biomes()
+
+# Soil physics (unchanged — biomes select from these)
 SOIL_TYPES = {"sand":  {"water_hold":0.3,"drain":0.8,"till_ease":1.2,"nutrient_hold":0.4},
               "loam":  {"water_hold":0.6,"drain":0.5,"till_ease":1.0,"nutrient_hold":0.7},
               "clay":  {"water_hold":0.9,"drain":0.2,"till_ease":0.7,"nutrient_hold":1.0}}
@@ -40,128 +62,151 @@ CROP_NPK = {"wheat":{"N":-8,"P":-3,"K":-5},"potato":{"N":-6,"P":-4,"K":-10},
 WATER_TYPES = ["pond","stream","well"]
 
 def generate_terrain():
-    """Generate a GRID_SIZE_X × GRID_SIZE_Y terrain with elevation, water, zones."""
-    X = GRID_SIZE_X
-    Y = GRID_SIZE_Y
+    """Phase W4: Generate 50×50 biome-based terrain with realistic pedology.
+
+    Biome distribution: alluvial_plain 40%, grassland 20%, forest 10%,
+    wetland 8%, hills_mountains 12%, riverbank 10%.
+    Each biome has its own soil properties, resources, and wildlife.
+    """
+    X, Y = GRID_SIZE_X, GRID_SIZE_Y
+    biomes = BIOME_DEFS.get("biomes", {})
+
+    # ── 1. Elevation: diamond-square style ──
     elev = [[0]*Y for _ in range(X)]
-    # Seed corners
     elev[0][0] = random.randint(2, 8)
     elev[0][Y-1] = random.randint(2, 8)
     elev[X-1][0] = random.randint(2, 8)
     elev[X-1][Y-1] = random.randint(2, 8)
-    for x in range(X):
-        for y in range(Y):
-            if (x == 0 and y == 0) or (x == 0 and y == Y-1) or (x == X-1 and y == 0) or (x == X-1 and y == Y-1):
-                continue
-            neighbors = []
-            if x > 0: neighbors.append(elev[x-1][y])
-            if y > 0: neighbors.append(elev[x][y-1])
-            if x < X-1: neighbors.append(elev[x+1][y])
-            if y < Y-1: neighbors.append(elev[x][y+1])
-            base = sum(neighbors) / len(neighbors) if neighbors else 5
-            elev[x][y] = max(0, min(10, int(base + random.randint(-2, 2))))
-    # Water sources — more for big farm (3-8)
+    for _ in range(3):  # multi-pass smoothing
+        for x in range(X):
+            for y in range(Y):
+                if x in (0, X-1) and y in (0, Y-1): continue
+                neighbors = []
+                for dx, dy in [(0,1),(1,0),(0,-1),(-1,0)]:
+                    nx, ny = x+dx, y+dy
+                    if 0 <= nx < X and 0 <= ny < Y:
+                        neighbors.append(elev[nx][ny])
+                base = sum(neighbors)/len(neighbors) if neighbors else 5
+                elev[x][y] = max(0, min(10, int(base + random.randint(-1, 1))))
+
+    # ── 2. Water sources ──
     water_sources = []
-    n_water = random.randint(3, 8)
+    n_water = random.randint(4, 10)
     for _ in range(n_water):
         wx = random.randint(int(X*0.1), int(X*0.9)-1)
         wy = random.randint(int(Y*0.1), int(Y*0.9)-1)
-        wtype = random.choice(["pond","stream"])
+        wtype = random.choice(["pond", "stream", "pond"])
         water_sources.append({"x": wx, "y": wy, "type": wtype, "depth": random.randint(2,5)})
-    # Zone assignment
-    zones = [[None]*Y for _ in range(X)]
-    margin = 2  # edge = wild_buffer
+
+    def _dist_water(px, py):
+        return min((abs(px-w["x"])+abs(py-w["y"])) for w in water_sources) if water_sources else 999
+
+    def _slope_at(px, py):
+        slopes = []
+        for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+            nx, ny = px+dx, py+dy
+            if 0 <= nx < X and 0 <= ny < Y:
+                slopes.append(abs(elev[px][py] - elev[nx][ny]))
+        return max(slopes) if slopes else 0
+
+    # ── 3. Biome assignment (procedural, elevation + water + noise) ──
+    grid_biome = [[""]*Y for _ in range(X)]
+    zones = [[""]*Y for _ in range(X)]
     for x in range(X):
         for y in range(Y):
             e = elev[x][y]
-            dist_to_water = min([abs(x-ws["x"])+abs(y-ws["y"]) for ws in water_sources]) if water_sources else 999
-            slopes = []
-            for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
-                nx, ny = x+dx, y+dy
-                if 0 <= nx < X and 0 <= ny < Y:
-                    slopes.append(abs(e - elev[nx][ny]))
-            slope = max(slopes) if slopes else 0
-            if x < margin or x >= X-margin or y < margin or y >= Y-margin:
-                zones[x][y] = "wild_buffer"
-            elif dist_to_water <= 3 and e <= 7 and slope <= 2:
-                zones[x][y] = "farmland"
-            elif e >= 6 and slope >= 3:
-                zones[x][y] = "orchard"
-            elif slope <= 1 and 3 <= e <= 7:
-                zones[x][y] = "pasture"
-            elif X//3 <= x <= 2*X//3 and Y//3 <= y <= 2*Y//3:
-                zones[x][y] = "building_area"
-            elif dist_to_water == 0:
-                zones[x][y] = "water_source"
+            dw = _dist_water(x, y)
+            s = _slope_at(x, y)
+            # Riverbank: within 1-2 tiles of water
+            if 1 <= dw <= 2 and e <= 6:
+                grid_biome[x][y] = "riverbank"
+            # Wetland: very low elevation, near water
+            elif e <= 2 and dw <= 4:
+                grid_biome[x][y] = "wetland"
+            # Hills/Mountains: high elevation or steep slope
+            elif e >= 7 or (e >= 5 and s >= 3):
+                grid_biome[x][y] = "hills_mountains"
+            # Forest: edges + moderate elevation
+            elif dw >= 8 and 4 <= e <= 7:
+                grid_biome[x][y] = "forest"
+            # Grassland: mid-elevation, away from center
+            elif 3 <= e <= 6 and s <= 2 and dw >= 4:
+                grid_biome[x][y] = "grassland"
+            # Default: alluvial_plain (farmland)
             else:
-                zones[x][y] = "farmland"
-    # Phase C: Orchard zones — 20% of farmland tiles, near edges
-    farm_tiles = [(x, y) for x in range(X) for y in range(Y) if zones[x][y] == "farmland"]
-    n_orchard = int(len(farm_tiles) * 0.15)
-    for x, y in random.sample(farm_tiles, min(n_orchard, len(farm_tiles))):
-        if x % 3 == 0:  # spaced for tree planting
-            zones[x][y] = "orchard"
-    # Microclimate
+                grid_biome[x][y] = "alluvial_plain"
+            zones[x][y] = grid_biome[x][y]  # zones mirror biomes for backward compat
+
+    # ── 4. Soil, NPK, moisture, topsoil per biome ──
+    soil_types = [[""]*Y for _ in range(X)]
+    soil_npk = [[""]*Y for _ in range(X)]
+    soil_moisture = [[50]*Y for _ in range(X)]
+    topsoil_depth = [[20]*Y for _ in range(X)]
+    biome_resources = [[""]*Y for _ in range(X)]
+
+    for x in range(X):
+        for y in range(Y):
+            bm = grid_biome[x][y]
+            bdef = biomes.get(bm, {})
+            bsoil = bdef.get("soil", {})
+            dw = _dist_water(x, y)
+
+            # Soil type
+            stypes = bsoil.get("types", ["loam"])
+            st = random.choice(stypes)
+            soil_types[x][y] = st
+
+            # NPK
+            props = SOIL_TYPES.get(st, SOIL_TYPES["loam"])
+            om_base = bsoil.get("organic_matter_base", 10)
+            nh = bsoil.get("nutrient_hold", 0.5)
+            base_n = int(20 + nh * 50 + random.randint(-5, 10))
+            base_p = int(20 + nh * 40 + random.randint(-5, 10))
+            base_k = int(20 + nh * 35 + random.randint(-5, 10))
+            om = om_base + random.randint(-3, 5)
+            ph_range = bsoil.get("ph_range", [5.5, 7.5])
+            ph = round(random.uniform(ph_range[0], ph_range[1]), 1)
+            soil_npk[x][y] = {"N": base_n, "P": base_p, "K": base_k, "organic_matter": om, "pH": ph}
+
+            # Moisture
+            wh = bsoil.get("water_hold", 0.5)
+            init_moist = int(20 + wh * 80 + (15 if dw <= 3 else 0) + random.randint(-5, 5))
+            soil_moisture[x][y] = max(5, min(100, init_moist))
+
+            # Topsoil
+            ts_min = bsoil.get("topsoil_min", 10)
+            ts_max = bsoil.get("topsoil_max", 30)
+            topsoil_depth[x][y] = random.randint(ts_min, ts_max)
+
+            # Resources (rare chance)
+            res_list = bdef.get("resources", [])
+            if res_list and random.random() < 0.15:
+                biome_resources[x][y] = random.choice(res_list)
+
+    # ── 5. Microclimate ──
     microclimate = [[{} for _ in range(Y)] for _ in range(X)]
     for x in range(X):
         for y in range(Y):
             e = elev[x][y]
-            s = _slope_at(elev, x, y)
+            bm = grid_biome[x][y]
+            bdef = biomes.get(bm, {})
+            s = _slope_at(x, y)
+            dw = _dist_water(x, y)
             mc = {}
-            s_neighbor = elev[x][y+1] if y < Y-1 else e
-            south_facing = (s_neighbor < e)
-            base_gdd_mod = 1.0 - (e - 5) * 0.04
-            if south_facing: base_gdd_mod += 0.05
-            if zones[x][y] == "orchard" and e >= 7: base_gdd_mod += 0.03
-            dist_w = min([abs(x-ws["x"])+abs(y-ws["y"]) for ws in water_sources]) if water_sources else 999
-            flood_risk = max(0, 0.3 - e*0.03 - dist_w*0.02)
-            frost_mod = 1.0 + max(0, (5-e)*0.08)
-            mc["gdd_mod"] = round(base_gdd_mod, 3)
-            mc["flood_risk"] = round(max(0, flood_risk), 3)
-            mc["frost_mod"] = round(frost_mod, 3)
+            base_gdd = 1.0 - (e - 5) * 0.04
+            if bm == "forest": base_gdd -= 0.05  # shade
+            if bm == "hills_mountains": base_gdd -= 0.08  # altitude
+            mc["gdd_mod"] = round(base_gdd, 3)
+            mc["flood_risk"] = round(bdef.get("flood_risk", 0.1), 3)
+            mc["frost_mod"] = round(1.0 + max(0, (6 - e) * 0.1), 3)
             mc["drainage"] = "good" if s >= 2 else ("poor" if e <= 3 else "moderate")
             microclimate[x][y] = mc
-    # Step 5: Soil — type, NPK, organic matter, pH, moisture
-    soil_types = [[None]*Y for _ in range(X)]
-    soil_npk    = [[None]*Y for _ in range(X)]
-    soil_moisture = [[50]*Y for _ in range(X)]
-    for x in range(X):
-        for y in range(Y):
-            e = elev[x][y]
-            dist_w = min([abs(x-ws["x"])+abs(y-ws["y"]) for ws in water_sources]) if water_sources else 999
-            # Low near water = clay (more water), high = sand (drains fast), mid = loam
-            if dist_w <= 2 and e <= 4: st = "clay"
-            elif e >= 7: st = "sand"
-            elif dist_w <= 2: st = "loam"
-            else: st = random.choice(["loam","loam","sand","clay"])
-            soil_types[x][y] = st
-            # NPK: base 30-60 each, higher in loam/clay
-            props = SOIL_TYPES[st]
-            base_n = int(30 + props["nutrient_hold"] * 40 + random.randint(-5, 10))
-            base_p = int(30 + props["nutrient_hold"] * 35 + random.randint(-5, 10))
-            base_k = int(30 + props["nutrient_hold"] * 30 + random.randint(-5, 10))
-            # Organic matter + pH
-            om = int(10 + random.randint(0, 15))
-            ph = round(random.uniform(5.5, 7.5), 1)
-            # Initial moisture: higher near water, lower on sand
-            init_moist = int(30 + props["water_hold"] * 60 + (10 if dist_w <= 2 else 0))
-            soil_moisture[x][y] = min(100, init_moist)
-            soil_npk[x][y] = {"N":base_n,"P":base_p,"K":base_k,"organic_matter":om,"pH":ph}
 
-    # Phase A: topsoil depth generation
-    topsoil_depth = [[0]*Y for _ in range(X)]
-    for x in range(X):
-        for y in range(Y):
-            st = soil_types[x][y]
-            if st == "sand":   topsoil_depth[x][y] = random.randint(18, 30)
-            elif st == "loam": topsoil_depth[x][y] = random.randint(20, 28)
-            elif st == "clay": topsoil_depth[x][y] = random.randint(15, 25)
-            else:              topsoil_depth[x][y] = random.randint(15, 25)
-
-    return {"elevation": elev, "zones": zones, "soil_types": soil_types,
-            "soil_npk": soil_npk, "soil_moisture": soil_moisture,
-            "water_sources": water_sources, "microclimate": microclimate,
-            "topsoil_depth": topsoil_depth}
+    return {"elevation": elev, "zones": zones, "biome": grid_biome,
+            "soil_types": soil_types, "soil_npk": soil_npk,
+            "soil_moisture": soil_moisture, "water_sources": water_sources,
+            "microclimate": microclimate, "topsoil_depth": topsoil_depth,
+            "biome_resources": biome_resources}
 
 
 def _npk_summary(f):
@@ -349,7 +394,7 @@ def hours_until_sunrise(farm):
     return (24.0 - h) + sr  # cross midnight
 
 def _do_day_advance(farm):
-    """Advance the farm by one game day. Called when clock crosses midnight."""
+    """Advance ONE farm by one game day."""
     farm["day"] = farm.get("day", 1) + 1
     if farm["day"] > 28:
         farm["day"] = 1
@@ -357,6 +402,97 @@ def _do_day_advance(farm):
         idx = seasons.index(farm.get("season","Spring"))
         farm["season"] = seasons[(idx+1)%4]
         farm["year"] = farm.get("year", 1) + 1
+def _check_day_barrier():
+    """If all ACTIVE farms are at the barrier, advance everyone together."""
+    global _day_barrier, _bulletin_board
+    # Only count farms belonging to agents active in this session
+    active_farms = {
+        fid: farm for fid, farm in farms.items()
+        if farm.get("agent_id") in _active_session_agents
+    }
+    if len(active_farms) == 0:
+        return False
+    ready = [fid for fid in active_farms if active_farms[fid].get("hour", 7.0) >= 24.0]
+    if len(ready) < len(active_farms):
+        return False
+    
+    # All farms ready — advance day for everyone
+    for fid in farms:
+        farm = farms[fid]
+        _do_day_advance(farm)
+        farm["hour"] = 6.0  # sunrise
+        # Reset daily flags
+        for c in farm.get("crops", []):
+            c["watered_today"] = False
+        _tick_weeds(farm)
+        tick_animal_disease(farm)
+        tick_perennials(farm)
+    
+    # Ecology tick (once for all farms)
+    global _ECOLOGY, _ecology_events
+    try:
+        farm_list = list(farms.values())
+        _ecology_events = _ECOLOGY.tick_day(farm_list)
+        for evt in _ecology_events:
+            if evt.target_agent:
+                for fid, f in farms.items():
+                    if f.get("agent_id") == evt.target_agent:
+                        f.setdefault("ecology_alerts", []).append({
+                            "type": evt.event_type,
+                            "description": evt.description,
+                            "importance": evt.importance,
+                            "details": evt.details,
+                        })
+    except Exception:
+        pass
+    
+    # Auto-post significant ecology events to bulletin board
+    for evt in _ecology_events:
+        if evt.importance >= 3:  # Only significant events
+            _bulletin_board.append({
+                "author": "system",
+                "author_name": "📢 山谷公告",
+                "season": list(farms.values())[0].get("season", "Spring") if farms else "Spring",
+                "day": list(farms.values())[0].get("day", 1) if farms else 1,
+                "hour": 6.0,
+                "message": f"[生态] {evt.description}",
+            })
+    
+    # Daily community summary
+    active_fids = [fid for fid in farms if farms[fid].get("agent_id") in _active_session_agents]
+    if active_fids:
+        sample_farm = farms[active_fids[0]]
+        season, day = sample_farm.get("season","?"), sample_farm.get("day",1)
+        # Summarize ecology events
+        eco_summary = ", ".join(set(evt.description[:30] for evt in _ecology_events if evt.importance >= 2))
+        if eco_summary:
+            _bulletin_board.append({
+                "author": "system",
+                "author_name": "📋 日终摘要",
+                "season": season, "day": day, "hour": 6.0,
+                "message": f"昨日生态事件: {eco_summary[:200]}",
+            })
+        # Summarize agent status
+        agent_statuses = []
+        for fid in active_fids:
+            f = farms[fid]
+            aid = f.get("agent_id","?")
+            name = agents.get(aid, {}).get("nickname", aid[:8])
+            gold = f.get("gold", 0)
+            crops = len(f.get("crops", []))
+            tilled = f.get("tilled", 0)
+            agent_statuses.append(f"{name}: {gold}G, {crops}株作物, {tilled}块地")
+        _bulletin_board.append({
+            "author": "system",
+            "author_name": "📋 社区快报",
+            "season": season, "day": day, "hour": 6.0,
+            "message": " | ".join(agent_statuses),
+        })
+    
+    # Clear barrier, keep bulletin history
+    _day_barrier.clear()
+    _bulletin_board[:] = _bulletin_board[-30:]
+    return True
 
 # ══ PHASE D4: SLEEPINESS ══
 SLEEPINESS_MAX = 80
@@ -397,6 +533,10 @@ TIME_COST = {
     "sleep": 0, "eat": 0.3, "drink_water": 0.1,
     "exercise": 0.8, "read": 1.0,
     "next_day": 0,
+    # Social actions — no time cost (family communication shouldn't waste farming time)
+    "bulletin_post": 0, "bulletin_read": 0, "send_gold": 0, "send_gift": 0,
+    "social_msg": 0, "social_lookup": 0, "trade_propose": 0, "trade_accept": 0,
+    "trade_reject": 0, "trade_counter": 0,
     # Livestock
     "feed_animals": 0.1,   # per animal (chicken:0.1, cow:0.15)
     "water_animals": 0.1,  # per animal
@@ -603,6 +743,10 @@ ANIMALS = {
 }
 # ═══════════════ ENERGY & SKILLS ═══════════════
 ENERGY_COST = {
+    # Social actions — zero energy (talking is free)
+    "bulletin_post": 0, "bulletin_read": 0, "send_gold": 0, "send_gift": 0,
+    "social_msg": 0, "social_lookup": 0, "trade_propose": 0, "trade_accept": 0,
+    "trade_reject": 0, "trade_counter": 0,
     "till":20,"plant":12,"water":10,"harvest":15,"fertilize":8,
     "buy":1,"buy_animal":2,"build":25,"save_seeds":5,"process":8,
     "sell_storage":2,"green_manure":10,"compost":5,"apply_compost":5,
@@ -1772,8 +1916,12 @@ def route_farm(method, path, headers, body):
             "frost_warning": f.get("weather_state",{}).get("frost_warning",False),
             "weed_count": len(f.get("weeds",[])),
             "topsoil_warnings": f.get("topsoil_warnings",[]),
-            "avg_topsoil": (sum(sum(row) for row in f.get("terrain",{}).get("topsoil_depth",[[15]*28]*20))
+            "avg_topsoil": (sum(sum(row) for row in f.get("terrain",{}).get("topsoil_depth",[[15]*GRID_SIZE_Y for _ in range(GRID_SIZE_X)]))
                             / max(1, GRID_SIZE_X*GRID_SIZE_Y)),
+            # Phase W4: biome + terrain data for exploration
+            "terrain_biome": f.get("terrain", {}).get("biome", None),
+            "terrain_elevation": f.get("terrain", {}).get("elevation", None),
+            "biome_resources": f.get("terrain", {}).get("biome_resources", None),
             # Phase B fields
             "available_contracts": f.get("available_contracts", []),
             "signed_contracts": f.get("signed_contracts", []),
@@ -1782,6 +1930,11 @@ def route_farm(method, path, headers, body):
                                   "sprinkler": "sprinkler" in f.get("buildings",[]),
                                   "drip": "drip" in f.get("buildings",[])},
             "animal_disease_status": f.get("animal_disease_status", []),
+            # Phase W6: Ecology sensory + alerts
+            "ecology_observations": _ECOLOGY.get_sensory(f, "close")[:5],
+            "ecology_distant": _ECOLOGY.get_sensory(f, "distant")[:3],
+            "wolf_warning": _ECOLOGY.get_wolf_warning(f) or "",
+            "ecology_alerts": f.get("ecology_alerts", []),
             # Phase C fields
             "perennial_crops": f.get("perennial_crops", []),
             "intercrop_tiles": f.get("intercrop_tiles", []),
@@ -1796,9 +1949,23 @@ def route_farm(method, path, headers, body):
     if m and method == "POST":
         fid = m.group(1)
         if fid not in farms: return json_resp({"success":False,"error":"农场不存在"}, 404)
+        # Mark this agent as active in the current session (for day barrier)
+        agent_id = farms[fid].get("agent_id")
+        if agent_id:
+            _active_session_agents.add(agent_id)
         try: data = json.loads(body) if body else {}
         except: data = {}
         action = data.get("action_type","")
+        
+        # Global crop_type alias — fix common LLM mistakes early
+        _CROP_ALIAS = {"winter":"winter_seeds","winter_seed":"winter_seeds",
+                       "spring":"parsnip","summer":"wheat","fall":"pumpkin",
+                       "powder":"powder_melon","小麦":"wheat","玉米":"corn",
+                       "土豆":"potato","南瓜":"pumpkin","防风草":"parsnip"}
+        if data.get("crop_type","") in _CROP_ALIAS:
+            data["crop_type"] = _CROP_ALIAS[data["crop_type"]]
+        if data.get("item_type","") in _CROP_ALIAS:
+            data["item_type"] = _CROP_ALIAS[data["item_type"]]
         f = farms[fid]
 
         season = f["season"]
@@ -1810,15 +1977,14 @@ def route_farm(method, path, headers, body):
             "fitness":1.0, "knowledge":{"farming":0,"husbandry":0,"economics":0,"machinery":0},"sleepiness":0})
 
         # ═══ D5: Auto day-advance if clock crossed midnight ═══
+        # When ANY agent reaches 24:00, push ALL agents to the barrier and advance together.
         if f.setdefault("hour", 7.0) >= 24.0 and action != "sleep":
-            _do_day_advance(f)
-            f["hour"] = f["hour"] - 24.0
-            # Reset daily flags
-            for c in f.get("crops", []):
-                c["watered_today"] = False
-            _tick_weeds(f)
-            tick_animal_disease(f)
-            tick_perennials(f)
+            # Force ALL active farms to midnight so the barrier triggers
+            for fid2 in farms:
+                if farms[fid2].get("agent_id") in _active_session_agents:
+                    farms[fid2]["hour"] = 24.0
+                    _day_barrier[fid2] = True
+            _check_day_barrier()
 
         # ═══ TRUE 24-HOUR CLOCK (Phase D5) ═══
         hour = f.setdefault("hour", 7.0)
@@ -1842,8 +2008,9 @@ def route_farm(method, path, headers, body):
         # Night restriction (based on actual clock time, not remaining daylight)
         if not is_daytime(f) and action in NIGHT_BLOCKED:
             sr, ss = DAY_RANGE.get(season, (6, 20))
+            time_msg = "天黑了" if hour >= ss else "还没日出"
             return json_resp({"success": False,
-                "action_result": f"天黑了——现在是{hour:.0f}:00，'{action}'只能在白天{sr:.0f}-{ss:.0f}点做!"})
+                "action_result": f"{time_msg}——现在是{hour:.0f}:00，'{action}'只能在白天{sr:.0f}-{ss:.0f}点做!"})
         # Clock advance: most actions advance the clock
         if action not in ("next_day","sleep","exercise","read","lookup","drink_water","drink_coffee","remember","recall","forget") and tcost > 0:
             f["hour"] = hour + tcost
@@ -1942,7 +2109,8 @@ def route_farm(method, path, headers, body):
             farm_skill = farmer.get("skills",{}).get("farming",1)
             if farm_skill < 2:
                 return json_resp({"success":False,"action_result":"农耕技能不足(Lv2+才能批量种植)"})
-            ct = (data.get("crop_type","") or data.get("item","") or data.get("seed","") or "parsnip").replace("_seeds","").strip()
+            raw = (data.get("crop_type","") or data.get("item","") or data.get("seed","") or "parsnip").strip()
+            ct = raw if raw in CROPS else raw.replace("_seeds","").strip()
             if ct not in CROPS: return json_resp({"success":False,"action_result":"未知作物"})
             if season not in CROPS[ct]["seasons"] and "greenhouse" not in f.get("buildings", []):
                 return json_resp({"success":False,"action_result":f"错误：{CROPS[ct]['name']}不能在{season}种植"})
@@ -1993,7 +2161,8 @@ def route_farm(method, path, headers, body):
                               "state_changes":{"energy":-ecost,"xp":5*n}})
 
         elif action == "plant":
-            ct = (data.get("crop_type","") or data.get("item","") or data.get("seed","") or data.get("crop","") or "parsnip").replace("_seeds","").strip()
+            raw = (data.get("crop_type","") or data.get("item","") or data.get("seed","") or data.get("crop","") or "parsnip").strip()
+            ct = raw if raw in CROPS else raw.replace("_seeds","").strip()
             if ct not in CROPS: return json_resp({"success":False,"action_result":"未知作物"})
             if season not in CROPS[ct]["seasons"] and "greenhouse" not in f.get("buildings", []):
                 return json_resp({"success":False,"action_result":f"错误：{CROPS[ct]['name']}不能在{season}种植"})
@@ -2336,7 +2505,19 @@ def route_farm(method, path, headers, body):
                 "action_result": f"交{contract['crop_name']}×{delivered}，获得{gold_earned}G"})
 
         elif action == "buy":
+            # PATCHED 2026-06-20: fix _seeds suffix
             crop_type = data.get("crop_type","") or data.get("item_type","") or data.get("item","")
+            # Common LLM mistakes — map wrong names to correct crop keys
+            _BUY_ALIASES = {
+                "winter": "winter_seeds", "winter_seed": "winter_seeds",
+                "spring": "parsnip", "summer": "wheat", "fall": "pumpkin",
+                "powder": "powder_melon", "melon_seed": "melon",
+                "小麦": "wheat", "玉米": "corn", "土豆": "potato", "南瓜": "pumpkin",
+                "防风草": "parsnip", "花椰菜": "cauliflower", "草莓": "strawberry",
+                "番茄": "tomato", "蓝莓": "blueberry", "甜瓜": "melon", "大豆": "soybean",
+            }
+            if crop_type in _BUY_ALIASES:
+                crop_type = _BUY_ALIASES[crop_type]
             qty = data.get("quantity",1)
             # Check food shop first
             if crop_type in MARKET_FOODS:
@@ -2363,13 +2544,23 @@ def route_farm(method, path, headers, body):
             if f["gold"] < cost:
                 return json_resp({"success":False,"action_result":"金币不足"})
             f["gold"] -= cost
-            seed_key = f"{crop_type}_seeds"
+            # Normalize: if crop_type already ends with _seeds, use as-is
+            if crop_type.endswith("_seeds"):
+                seed_key = crop_type
+            else:
+                seed_key = f"{crop_type}_seeds"
+            # PATCHED: write debug log
+            try:
+                with open("C:/Users/m1916/agent-brain/debug_buy.log", "a") as _dbg:
+                    _dbg.write(f"crop_type={crop_type!r} seed_key={seed_key!r} action={action!r}\n")
+            except: pass
             for item in f["inventory_items"]:
                 if item["key"] == seed_key:
                     item["count"] += qty; break
             else:
                 f["inventory_items"].append({"key":seed_key,"name":f"{CROPS[crop_type]['name']}种子","count":qty})
-            return json_resp({"success":True,"action_result":f"购买{qty}个{CROPS[crop_type]['name']}种子，花费{cost}G",
+            return json_resp({"success":True,
+                "action_result":f"[PATCHED] 购买{qty}个{CROPS[crop_type]['name']}种子(inv_key={seed_key})，花费{cost}G",
                               "state_changes":{"gold":-cost}})
 
         elif action == "weed_all":
@@ -3029,12 +3220,94 @@ def route_farm(method, path, headers, body):
             return json_resp({"success":True,
                 "action_result":f"阅读{topic}——学识+{gain:.2f}({knowledge.get(topic,0):.1f}/5.0)"})
 
+        # ═══ PHASE W4: EXPLORE (discover terrain, biome, resources) ═══
+        elif action == "explore":
+            terrain = f.get("terrain", {})
+            biome_grid = terrain.get("biome", None)
+            elev_grid = terrain.get("elevation", None)
+            res_grid = terrain.get("biome_resources", None)
+            soil_grid = terrain.get("soil_types", None)
+            moisture_grid = terrain.get("soil_moisture", None)
+            topsoil_grid = terrain.get("topsoil_depth", None)
+            npk_grid = terrain.get("soil_npk", None)
+            water_sources = terrain.get("water_sources", [])
+
+            pos = data.get("positions", [[0,0]])[0] if data.get("positions") else [0,0]
+            px, py = pos[0], pos[1]
+
+            discovery = {"x": px, "y": py}
+            if biome_grid and px < len(biome_grid) and py < len(biome_grid[0]):
+                discovery["biome"] = biome_grid[px][py]
+            if elev_grid and px < len(elev_grid) and py < len(elev_grid[0]):
+                discovery["elevation"] = elev_grid[px][py]
+            if res_grid and px < len(res_grid) and py < len(res_grid[0]):
+                discovery["resource"] = res_grid[px][py] if res_grid[px][py] else "(nothing special)"
+            if soil_grid and px < len(soil_grid) and py < len(soil_grid[0]):
+                discovery["soil_type"] = soil_grid[px][py]
+            if moisture_grid and px < len(moisture_grid) and py < len(moisture_grid[0]):
+                discovery["soil_moisture"] = moisture_grid[px][py]
+            if topsoil_grid and px < len(topsoil_grid) and py < len(topsoil_grid[0]):
+                discovery["topsoil_depth"] = topsoil_grid[px][py]
+            if npk_grid and px < len(npk_grid) and py < len(npk_grid[0]):
+                n = npk_grid[px][py]
+                if n:
+                    discovery["npk_N"] = n.get("N", 0)
+                    discovery["organic_matter"] = n.get("organic_matter", 10)
+
+            # Nearby water
+            nearby_water = [w for w in water_sources if abs(w["x"]-px) + abs(w["y"]-py) <= 5]
+            if nearby_water:
+                discovery["water_nearby"] = True
+                discovery["water_sources_nearby"] = [{"x": w["x"], "y": w["y"], "type": w["type"]} for w in nearby_water[:3]]
+
+            # Compute distance from farm center (tile 0,0 = default starting point)
+            dist = abs(px) + abs(py)
+
+            # Build a natural-language description
+            biome_names = BIOME_DEFS.get("biomes", {})
+            bm = discovery.get("biome", "alluvial_plain")
+            bd = biome_names.get(bm, {})
+            biome_desc = bd.get("desc", "平坦的土地")
+
+            desc_lines = [f"探索了({px},{py})——{bd.get('display_name', bm)}"]
+            if dist <= 5:
+                desc_lines.append("就在附近")
+            elif dist <= 15:
+                desc_lines.append("需要走一段距离")
+            else:
+                desc_lines.append("相当偏远的地方")
+            desc_lines.append(f"地形: {biome_desc}")
+            if discovery.get("resource") and discovery["resource"] != "(nothing special)":
+                desc_lines.append(f"发现: {discovery['resource']}")
+            if discovery.get("water_nearby"):
+                desc_lines.append("附近有水")
+
+            # Remove old data on exploration — agent must explore again if conditions change
+            farmer["fatigue"] = min(100, farmer.get("fatigue", 0) + 5)
+            farmer["sleepiness"] = min(80, farmer.get("sleepiness", 0) + 3)
+
+            resp_data = {
+                "success": True,
+                "action_result": " ".join(desc_lines),
+                "discovery": discovery,
+            }
+            return json_resp(resp_data)
+
         elif action == "sleep":
             sleepiness = farmer.get("sleepiness", 0)
             # Nighttime: always allow sleep (natural time to sleep even if not exhausted)
             is_night = not is_daytime(f)
             if sleepiness < 10 and not is_night:
                 return json_resp({"success":False,"action_result":"还不困——白天不需要睡觉。晚上或困了再来!"})
+            # If already at midnight waiting for others, suggest alternatives
+            if f.get("hour", 0) >= 24.0:
+                active_count = sum(1 for f2 in farms.values() if f2.get("agent_id") in _active_session_agents)
+                ready_count = sum(1 for f2 in farms.values() 
+                                if f2.get("agent_id") in _active_session_agents and f2.get("hour", 0) >= 24.0)
+                waiting = active_count - ready_count
+                if waiting > 0:
+                    return json_resp({"success":False,
+                        "action_result":f"你已经在午夜了——还要等{waiting}位农场主就寝。可以 read 或 exercise 打发时间。"})
             # Fitness boosts sleep recovery: fitness 2.0 → 15/h instead of 10/h
             fit_mult = 1.0 + (farmer.get("fitness",1.0) - 1.0) * 0.5
             recover_rate = SLEEPINESS_SLEEP_RECOVER * fit_mult
@@ -3051,15 +3324,27 @@ def route_farm(method, path, headers, body):
             # D5: Clock advance — sleep consumed real time
             old_hour = f.setdefault("hour", 7.0)
             new_hour = old_hour + hours_slept
-            crossed_midnight = False
-            while new_hour >= 24.0:
-                new_hour -= 24.0
-                crossed_midnight = True
-                _do_day_advance(f)
-            f["hour"] = new_hour
-            # GDD for sleep hours (crops still grow while you sleep!)
-            tick_hourly_gdd(f, hours_slept)
-            day_note = " → 新的一天!" if crossed_midnight else f" (醒来{new_hour:.0f}:00)"
+            
+            if new_hour >= 24.0:
+                # Cap at midnight — wait for other agents at day barrier
+                f["hour"] = 24.0
+                _day_barrier[fid] = True
+                tick_hourly_gdd(f, 24.0 - old_hour)
+                
+                all_ready = _check_day_barrier()
+                if all_ready:
+                    day_note = " → 新的一天!"
+                else:
+                    total = sum(1 for f2 in farms.values() if f2.get("agent_id") in _active_session_agents)
+                    ready = sum(1 for f2 in farms.values() 
+                               if f2.get("agent_id") in _active_session_agents and f2.get("hour", 0) >= 24.0)
+                    waiting = total - ready
+                    day_note = f" (醒来0:00 — 等待{waiting}位农场主就寝后一起进入新的一天...)"
+            else:
+                f["hour"] = new_hour
+                tick_hourly_gdd(f, hours_slept)
+                day_note = f" (醒来{new_hour:.0f}:00)"
+            
             return json_resp({"success":True,
                 "action_result":f"睡了{hours_slept}h——睡意-{recover} 体力+{energy_gain} 疲劳-50{day_note}"})
 
@@ -3329,6 +3614,97 @@ def route_farm(method, path, headers, body):
             return json_resp({"success":True,
                 "action_result":f"还款{amount}G——剩余{loan['remaining']}G（{loan['days_left']}天）"})
 
+        # ═══ BULLETIN BOARD (Phase W5: public message board) ═══
+        elif action == "bulletin_post":
+            msg = data.get("message", "").strip()
+            if not msg:
+                return json_resp({"success":False,"action_result":"留言不能为空"})
+            if len(msg) > 300:
+                return json_resp({"success":False,"action_result":"留言过长（限300字）"})
+            post = {
+                "author": f.get("agent_id", "unknown"),
+                "author_name": agents.get(f.get("agent_id",""), {}).get("nickname", "某人"),
+                "season": f.get("season","Spring"),
+                "day": f.get("day",1),
+                "hour": f.get("hour",7.0),
+                "message": msg,
+            }
+            _bulletin_board.append(post)
+            _bulletin_board[:] = _bulletin_board[-30:]  # keep last 30
+            return json_resp({"success":True,"action_result":f"📋 留言已发布: {msg[:60]}..."})
+
+        elif action == "bulletin_read":
+            if not _bulletin_board:
+                return json_resp({"success":True,"action_result":"📋 留言栏空空如也——还没有人发布过消息。"})
+            lines = ["📋 === 农场公共留言栏 ==="]
+            for p in _bulletin_board[-10:]:
+                lines.append(f"  [{p['season']}D{p['day']} {p['hour']:.0f}:00] {p['author_name']}: {p['message'][:100]}")
+            lines.append("使用 bulletin_post(message) 发布留言")
+            return json_resp({"success":True,"action_result":"\n".join(lines)})
+
+        # ═══ SEND GIFT — unconditional item transfer ═══
+        elif action == "send_gift":
+            target_name = data.get("target", "").strip()
+            item_type = data.get("item", "").strip()
+            qty = int(data.get("qty", data.get("quantity", 1)))
+            if not target_name or not item_type:
+                return json_resp({"success":False,"action_result":"send_gift需要 target(收礼人) 和 item(物品类型)"})
+            # Find target farm
+            target_fid = None
+            target_aid = None
+            for fid2, f2 in farms.items():
+                aid2 = f2.get("agent_id", "")
+                if aid2 in agents:
+                    if agents[aid2].get("nickname", "") == target_name or agents[aid2].get("username", "") == target_name:
+                        target_fid = fid2
+                        target_aid = aid2
+                        break
+            if not target_fid:
+                return json_resp({"success":False,"action_result":f"找不到{target_name}——检查名字是否正确"})
+            # Find item in storage
+            storage = f.get("storage", [])
+            matches = [s for s in storage if s.get("crop_type","") == item_type or s.get("name","") == item_type]
+            if len(matches) < qty:
+                return json_resp({"success":False,"action_result":f"你没有足够的{item_type}（需要{qty}，有{len(matches)}）"})
+            # Transfer
+            for _ in range(qty):
+                item = matches.pop(0)
+                storage.remove(item)
+                farms[target_fid].setdefault("storage", []).append(item)
+            # Notify target
+            my_name = agents.get(f.get("agent_id",""), {}).get("nickname", "某人")
+            farms[target_fid].setdefault("notifications", []).append(
+                f"🎁 {my_name}送给你 {qty}个{item_type}！已放入仓库。"
+            )
+            return json_resp({"success":True,"action_result":f"🎁 已送给{target_name} {qty}个{item_type}！"})
+
+        # ═══ SEND GOLD — transfer gold between family members ═══
+        elif action == "send_gold":
+            target_name = data.get("target", "").strip()
+            amount = int(data.get("amount", 0))
+            if not target_name or amount <= 0:
+                return json_resp({"success":False,"action_result":"send_gold需要 target(收礼人) 和 amount(金额)"})
+            if f["gold"] < amount:
+                return json_resp({"success":False,"action_result":f"金币不足——你有{f['gold']}G，需要{amount}G"})
+            # Find target farm
+            target_fid = None
+            for fid2, f2 in farms.items():
+                aid2 = f2.get("agent_id", "")
+                if aid2 in agents:
+                    if agents[aid2].get("nickname", "") == target_name:
+                        target_fid = fid2
+                        break
+            if not target_fid:
+                return json_resp({"success":False,"action_result":f"找不到{target_name}"})
+            # Transfer
+            f["gold"] -= amount
+            farms[target_fid]["gold"] = farms[target_fid].get("gold", 0) + amount
+            my_name = agents.get(f.get("agent_id",""), {}).get("nickname", "某人")
+            farms[target_fid].setdefault("notifications", []).append(
+                f"💰 {my_name}转给你 {amount}G！"
+            )
+            return json_resp({"success":True,"action_result":f"💰 已转给{target_name} {amount}G！（剩余{f['gold']}G）"})
+
         return json_resp({"success":False,"action_result":"未知操作"})
 
     # POST /api/farm/{id}/next-day
@@ -3538,16 +3914,14 @@ def route_farm(method, path, headers, body):
                                 f["score"] = f.get("score", 0) + 25
                                 break
 
-        # ═══ DIRECT DAY ADVANCE (24h system — no phases) ═══
-        # next_day always advances to the next morning
-        f["day"] += 1
-        if f["day"] > 28:
-            f["day"] = 1
-            idx = SEASONS.index(season)
-            f["season"] = SEASONS[(idx+1)%4]
-            f["season_en"] = f["season"]
-        f["day_phase"] = "morning"
-        f["day_actions_used"] = 0
+        # ═══ DAY ADVANCE — push all farms to the shared barrier ═══
+        # When ANY agent calls next_day, force ALL agents to midnight
+        # so the day barrier advances everyone together.
+        for fid2 in farms:
+            if farms[fid2].get("agent_id") in _active_session_agents:
+                farms[fid2]["hour"] = 24.0
+                _day_barrier[fid2] = True
+        _check_day_barrier()
 
         # ═══════════ TRUE DAY BOUNDARY ═══════════
 
@@ -4147,6 +4521,10 @@ SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_worl
 if not os.path.exists(os.path.dirname(SAVE_FILE)):
     SAVE_FILE = r"C:\Users\m1916\agent-brain\agent_world_save.json"
 
+# Phase W6: Initialize ecology engine
+_ECOLOGY = ecology_engine.EcologyEngine()
+_ecology_events = []  # buffer for current-day events, flushed each cycle
+
 _last_save = 0
 
 def save_state():
@@ -4161,11 +4539,13 @@ def save_state():
             "farms": farms, "bar_sessions": bar_sessions,
             "guestbook": guestbook, "market_supply": market_supply,
             "active_loans": active_loans, "insurance_policies": insurance_policies,
+            "ecology": _ECOLOGY.to_dict(),  # Phase W6
+            "_bulletin_board": _bulletin_board,
         }
         with open(SAVE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass  # silent failure — don't crash the server
+    except Exception as e:
+        print(f"  [WARN] Failed to save state: {e}")
 
 def load_state():
     global agents, api_key_to_id, farms, bar_sessions, guestbook, market_supply, active_loans, insurance_policies
@@ -4181,9 +4561,17 @@ def load_state():
             market_supply = data.get("market_supply", {})
             active_loans = data.get("active_loans", {})
             insurance_policies = data.get("insurance_policies", {})
+            # Phase W6: Restore ecology state
+            if "ecology" in data:
+                global _ECOLOGY
+                _ECOLOGY = ecology_engine.EcologyEngine.from_dict(data["ecology"])
+            # Restore bulletin board
+            if "_bulletin_board" in data:
+                global _bulletin_board
+                _bulletin_board[:] = data["_bulletin_board"]
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [WARN] Failed to load save file: {e}")
     return False
 
 
@@ -4257,6 +4645,18 @@ def start_server(port, name):
 # ═══════════════════════════ MAIN ═══════════════════════════════
 
 if __name__ == "__main__":
+
+    # Seed: community bulletin with a starter message
+    if not _bulletin_board:
+        _bulletin_board.append({
+            "author": "system",
+            "author_name": "🏠 祖父",
+            "season": "Spring",
+            "day": 1,
+            "hour": 6.0,
+            "message": "孩子们，这片土地是咱家的命根子。我的病需要一大笔钱——你们得齐心协力。别怕开口求助，也别舍不得帮自家人。",
+        })
+
     loaded = load_state()
     print("="*60)
     print("AGENT WORLD LOCAL — 3 sites, zero rate limits")
